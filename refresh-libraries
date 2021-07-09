@@ -1,0 +1,124 @@
+#!/usr/bin/python3
+from typing import List
+from urllib.parse import urljoin
+import argparse
+import json
+import os
+import requests
+import sys
+import xml.etree.ElementTree as xml
+
+def refresh_radarr_library(base_url: str, api_key: str) -> None:
+    requests.post(
+        urljoin(f"{base_url}/", "api/v3/command"),
+        params={
+            "apiKey": api_key,
+        },
+        headers={
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "name": "RefreshMovie",
+        }),
+    ).raise_for_status()
+
+
+def refresh_sonarr_library(base_url: str, api_key: str) -> None:
+    requests.post(
+        urljoin(f"{base_url}/", "api/command"),
+        params={
+            "apikey": api_key,
+        },
+        headers={
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "name": "RefreshSeries",
+        }),
+    ).raise_for_status()
+
+
+class PlexClient:
+    def __init__(self, plex_base_url: str, plex_token: str):
+        self.__plex_base_url = plex_base_url
+        self.__plex_token = plex_token
+
+
+    def __create_plex_request(self, relative_path: str) -> str:
+        response = requests.get(
+            urljoin(f"{self.__plex_base_url}/", relative_path),
+            timeout=3,
+            headers={
+                "X-Plex-Token": self.__plex_token,
+            },
+        )
+
+        response.raise_for_status()
+
+        return response.text
+
+
+    def get_plex_library_sections(self) -> List[str]:
+        sections = xml.fromstring(self.__create_plex_request("library/sections"))
+
+        return [section.attrib["key"] for section in sections]
+
+
+    def refresh_plex_library_section(self, section_id: str) -> None:
+        self.__create_plex_request(f"library/sections/{section_id}/refresh")
+
+
+    def refresh_all_plex_libraries(self) -> None:
+        for section_id in self.get_plex_library_sections():
+            self.refresh_plex_library_section(section_id)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description="Radarr, Sonarr, & Plex library refresher",
+        epilog="All arguments will also fallback to environment variable settings of their name in capitalized snake case if not set. For example: if --plex-token isn't set, it will try to read the PLEX_TOKEN environment variable value",
+    )
+
+    parser.add_argument("--plex-base-url", type=str, nargs="?", default=os.getenv("PLEX_BASE_URL"), metavar="http://example.com:32400")
+    parser.add_argument("--plex-token", type=str, nargs="?", default=os.getenv("PLEX_TOKEN"), metavar="Z99EuQ9Xy9G9z9PQFl99")
+    parser.add_argument("--sonarr-base-url", type=str, nargs="?", default=os.getenv("SONARR_BASE_URL"), metavar="http://example.com/sonarr")
+    parser.add_argument("--sonarr-api-key", type=str, nargs="?", default=os.getenv("SONARR_API_KEY"), metavar="6ce909a20a634f7cbe245e1893865ee5")
+    parser.add_argument("--radarr-base-url", type=str, nargs="?", default=os.getenv("RADARR_BASE_URL"), metavar="http://example.com/radarr")
+    parser.add_argument("--radarr-api-key", type=str, nargs="?", default=os.getenv("RADARR_API_KEY"), metavar="7ce909a20a634f7cbe245e1893865ee8")
+
+    args = parser.parse_args()
+
+    print_help = True
+
+    if bool(args.plex_base_url) != bool(args.plex_token):
+        print("if refreshing Plex, both the base url & token must be set", file=sys.stderr)
+        sys.exit(1)
+
+    if bool(args.sonarr_base_url) != bool(args.sonarr_api_key):
+        print("if refreshing sonarr, both the base url & API key must be set", file=sys.stderr)
+        sys.exit(2)
+
+    if bool(args.radarr_base_url) != bool(args.radarr_api_key):
+        print("if refreshing radarr, both the base url & API key must be set", file=sys.stderr)
+        sys.exit(3)
+
+    if args.plex_base_url:
+        print_help = False
+        print(f"refreshing all Plex libraries at {args.plex_base_url}")
+        PlexClient(args.plex_base_url, args.plex_token).refresh_all_plex_libraries()
+        print(f"successfully initiated a refresh of all Plex libraries at {args.plex_base_url}")
+
+    if args.sonarr_base_url:
+        print_help = False
+        print(f"refreshing sonarr library at {args.sonarr_base_url}")
+        refresh_sonarr_library(args.sonarr_base_url, args.sonarr_api_key)
+        print(f"successfully initiated a refresh for the sonarr library at {args.sonarr_base_url}")
+
+    if args.radarr_base_url:
+        print_help = False
+        print(f"refreshing radarr library at {args.radarr_base_url}")
+        refresh_radarr_library(args.radarr_base_url, args.radarr_api_key)
+        print(f"successfully initiated a refresh for the radarr library at {args.radarr_base_url}")
+
+    if print_help:
+        parser.print_help()
+        sys.exit(-1)

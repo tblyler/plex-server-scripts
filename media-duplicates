@@ -1,0 +1,227 @@
+#!/usr/bin/python3
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple
+import argparse
+import json
+import os
+import random
+import requests
+import shlex
+import sqlite3
+import subprocess
+import sys
+
+def ffprobe_file_path(file_path: str):
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path],
+        capture_output=True,
+    )
+
+    result.check_returncode()
+
+    return json.loads(result.stdout)
+
+
+def get_first_video_stream(ffprobe_info):
+    for stream in ffprobe_info["streams"]:
+        if stream["codec_type"] == "video":
+            return stream
+
+    raise Exception("there is no video stream")
+
+
+def codec_name_is_h265(codec_name: str) -> bool:
+    return codec_name.find("265") or codec_name.find("HEVC") or codec_name.find("hevc")
+
+
+# returns less than 0 if first is worse than second
+# returns greater than 0 if first is better than second
+# returns 0 if they are roughly the same
+def compare_ffprobe_output(first, second) -> int:
+    first_stream = get_first_video_stream(first)
+    second_stream = get_first_video_stream(second)
+
+    # whichever has the most surface area, aka, highest resolution wins by default
+    first_area = first_stream["width"] * first_stream["height"]
+    second_area = second_stream["width"] * second_stream["height"]
+    if first_area > second_area:
+        return 1
+    if second_area > first_area:
+        return -1
+
+    # if resolutions are the same, prefer h265
+    first_is_h265 = codec_name_is_h265(first_stream["codec_name"])
+    second_is_h265 = codec_name_is_h265(second_stream["codec_name"])
+
+    if first_is_h265:
+        if not second_is_h265:
+            return 1
+    elif second_is_h265:
+        return -1
+
+    # if both are h265 or both are not h265, use bitrate
+    first_bitrate = first["format"]["bit_rate"]
+    second_bitrate = second["format"]["bit_rate"]
+
+    if first_bitrate > second_bitrate:
+        return 1
+
+    if second_bitrate > first_bitrate:
+        return -1
+
+    # at this point, I consider these files to be the same
+    return 0
+
+
+def compare_radarr(radarr_db_path1: str, radarr_db_path2: str) -> List[Tuple[str, str]]:
+    result = []
+
+    with sqlite3.connect(":memory:", uri=True) as db:
+        db.execute("ATTACH DATABASE ? AS ?", (f"file:{radarr_db_path1}?mode=ro", "db1"))
+        db.execute("ATTACH DATABASE ? AS ?", (f"file:{radarr_db_path2}?mode=ro", "db2"))
+
+        rows = db.execute("""
+            SELECT m1.Path || '/' || mf1.RelativePath, m2.Path || '/' || mf2.RelativePath
+                FROM db1.Movies     AS m1
+                JOIN db2.Movies     AS m2  ON m1.ImdbId = m2.ImdbId
+                JOIN db1.MovieFiles AS mf1 ON m1.MovieFileId = mf1.Id
+                JOIN db2.MovieFiles AS mf2 ON m2.MovieFileId = mf2.Id
+        """).fetchall()
+
+        for path1, path2 in rows:
+            result.append((path1, path2))
+
+    return result
+
+
+def compare_sonarr(sonarr_db_path1: str, sonarr_db_path2: str) -> List[Tuple[str, str]]:
+    result = []
+
+    with sqlite3.connect(":memory:", uri=True) as db:
+        db.execute("ATTACH DATABASE ? AS ?", (f"file:{sonarr_db_path1}?mode=ro", "db1"))
+        db.execute("ATTACH DATABASE ? AS ?", (f"file:{sonarr_db_path2}?mode=ro", "db2"))
+
+        rows = db.execute("""
+            SELECT s1.Path || '/' || ef1.RelativePath, s2.Path || '/' || ef2.RelativePath
+                FROM db1.Series       AS s1
+                JOIN db2.Series       AS s2  ON s1.ImdbId        = s2.ImdbId
+                JOIN db1.Episodes     AS e1  ON e1.SeriesId      = s1.Id
+                JOIN db2.Episodes     AS e2  ON e2.SeriesId      = s2.Id AND e2.SeasonNumber = e1.SeasonNumber AND e2.EpisodeNumber = e1.EpisodeNumber
+                JOIN db1.EpisodeFiles AS ef1 ON e1.EpisodeFileId = ef1.Id
+                JOIN db2.EpisodeFiles AS ef2 ON e2.EpisodeFileId = ef2.Id
+        """).fetchall()
+
+        for path1, path2 in rows:
+            result.append((path1, path2))
+
+    return result
+
+def rewrite_path(path: str, rewrites: Dict[str, str]) -> str:
+    if rewrites:
+        for orig, rewrite in rewrites.items():
+            if path.startswith(orig):
+                return path.replace(orig, rewrite, 1)
+
+    return path
+
+def rejigger_rewrite_paths(rewrite_paths: List[str]) -> Dict[str, str]:
+    result = {}
+
+    for rewrite_path in rewrite_paths:
+        orig, rewrite = rewrite_path.split(sep=':', maxsplit=1)
+        result[orig] = rewrite
+
+    return result
+
+def compare_media_file_paths(path1: str, path2: str):
+    try:
+        stat1 = os.lstat(path1)
+        stat2 = os.lstat(path2)
+        if stat1.st_ino == stat2.st_ino and stat1.st_dev == stat2.st_dev:
+            return None
+    except Exception as e:
+        print(f"failed to check inodes for {path1} and {path2}: {e}", file=sys.stderr)
+        return None
+
+    try:
+        return compare_ffprobe_output(ffprobe_file_path(path1), ffprobe_file_path(path2))
+    except Exception as e:
+        print(f"failed to compare ffprobe output for {path1} and {path2}: {e}", file=sys.stderr)
+        return None
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description="radarr & sonarr duplicate checker across two database files",
+    )
+
+    parser.add_argument('--sonarr-db-paths', type=argparse.FileType('r'), nargs=2, metavar=("/home/sonarr/sonarr.db", "/home/othersonarr/sonarr.db"), required=True)
+    parser.add_argument('--radarr-db-paths', type=argparse.FileType('r'), nargs=2, metavar=("/home/radarr/radarr.db", "/home/otherradarr/radarr.db"), required=True)
+    parser.add_argument('--path-prefix-rewrite', type=str, nargs='+', metavar=("/media:/mnt/media", "/data:/real/path/data"), help="rewrite the paths for internal database media paths to the 'real' destinations")
+    parser.add_argument('--command-output-file', type=argparse.FileType('w'), nargs='?', default=sys.stdout)
+    parser.add_argument('--slack-webhook-url', type=str, nargs='?', default=None)
+    args = parser.parse_args()
+
+    for file_descriptor in args.sonarr_db_paths + args.radarr_db_paths:
+        file_descriptor.close()
+
+    duplicate_paths = compare_sonarr(args.sonarr_db_paths[0].name, args.sonarr_db_paths[1].name) + compare_radarr(args.radarr_db_paths[0].name, args.radarr_db_paths[1].name)
+
+    if args.path_prefix_rewrite:
+        rewrite_paths = rejigger_rewrite_paths(args.path_prefix_rewrite)
+        duplicate_paths = [(rewrite_path(path1, rewrite_paths), rewrite_path(path2, rewrite_paths)) for path1, path2 in duplicate_paths]
+
+    already_saved_space_in_bytes = 0
+    space_savings_in_bytes = 0
+    files_to_link = 0
+    files_already_linked = 0
+
+    # createa a process pool for NumCPUs * 2
+    # this is really just used for `ffprobe` concurrent calls
+    with ThreadPoolExecutor(max_workers=len(os.sched_getaffinity(0))*2) as executor:
+        def map_helper(args):
+            return compare_media_file_paths(args[0], args[1])
+
+        for (path1, path2), probe_result in zip(duplicate_paths, executor.map(map_helper, duplicate_paths)):
+            if probe_result is None:
+                files_already_linked += 1
+                already_saved_space_in_bytes += os.lstat(path1).st_size
+                continue
+
+            if probe_result == 0:
+                # if the results seem equal, let us flip a figurative coin for which path to overwrite
+                print("# this is the result of a coin flip", file=args.command_output_file)
+                path1, path2 = random.sample([path1, path2], k=2)
+            elif probe_result < 0:
+                # path2 is better than path1
+                path1, path2 = path2, path1
+
+            file_size_in_bytes = os.lstat(path2).st_size
+            space_savings_in_bytes += file_size_in_bytes
+            files_to_link += 1
+
+            print(f"# space savings of {file_size_in_bytes/(1024**3):.2f} GiB", file=args.command_output_file)
+            print(f"rm -f {shlex.quote(path2)}", file=args.command_output_file)
+
+            # replace path2's file name with path1's file name
+            path2 = os.path.join(os.path.dirname(path2), os.path.basename(path1))
+            print(f"ln -f {shlex.quote(path1)} {shlex.quote(path2)}", file=args.command_output_file)
+
+    if args.slack_webhook_url:
+        message = "nothing to link for file deduplication"
+        if files_to_link > 0:
+            message = f"HOLY SMOKES! We can save {space_savings_in_bytes/(1024**3):.2f} GiB by hard linking {files_to_link} files"
+
+        message += f"\nWe already save {already_saved_space_in_bytes/(1024**3):.2f} GiB by hard linking {files_already_linked} files"
+
+        requests.post(
+            args.slack_webhook_url,
+            headers={
+                'Content-type': 'application/json',
+            },
+            data=json.dumps({
+                "username": "Apollo Media Duplicates",
+                "icon_emoji": ":floppy_disk:",
+                "text": message,
+            }),
+        ).raise_for_status()
